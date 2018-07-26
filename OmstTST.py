@@ -25,6 +25,7 @@
 import OmstNET
 import time
 import operator
+import OmstUTL
 
 def verify_command(mn,aa,cmd,why=None,**kwargs):
     """
@@ -78,6 +79,8 @@ def verify_commands(mn,aa,cfg=tuple([0 if i & 4 else 128 for i in range(16)])):
     be easily looped back.
     """
     MMMM = sum(tuple(1<<i for i in range(16) if cfg[i] == 128))
+    mmmm = operator.xor(MMMM,0xffff)
+
     verify_command(mn,aa,mn.power_up_clear(aa))
     verify_command(mn,aa,mn.identify_type(aa))
     verify_command(mn,aa,mn.repeat_last_response(aa),\
@@ -101,7 +104,7 @@ def verify_commands(mn,aa,cfg=tuple([0 if i & 4 else 128 for i in range(16)])):
                    'Activate outputs verify with readback')
     verify_command(mn,aa,mn.read_module_status(aa),**kwargs)
 
-    kwargs = {'PPPP':MMMM,'NNNN':0}
+    kwargs = {'PPPP':mmmm,'NNNN':0}
     verify_command(mn,aa,mn.read_and_optionally_clear_latches_group(aa,1),\
                    'Read, clear, verify positive latches',**kwargs)
     
@@ -110,7 +113,7 @@ def verify_commands(mn,aa,cfg=tuple([0 if i & 4 else 128 for i in range(16)])):
                    'Deactivate outputs and verify with readback')
     verify_command(mn,aa,mn.read_module_status(aa),**kwargs)
 
-    kwargs = {'PPPP':0,'NNNN':MMMM}
+    kwargs = {'PPPP':0,'NNNN':mmmm}
     verify_command(mn,aa,mn.read_and_optionally_clear_latches_group(aa,2),\
                    'Read, clear, verify negative latches',**kwargs)
     
@@ -148,7 +151,6 @@ def verify_commands(mn,aa,cfg=tuple([0 if i & 4 else 128 for i in range(16)])):
     verify_command(mn,aa,mn.identify_type(aa),\
                    'If identify type is acked, wd was disabled successfully')
     
-    mmmm = operator.xor(MMMM,0xffff)
     verify_command(mn,aa,mn.enable_disable_counter_group(aa,mmmm,1),
                    'Enable inputs as counters')
     kwargs = {'DDDDDDDD':tuple(0 for i in range(16) if (mmmm & (1 << i)))}
@@ -235,13 +237,13 @@ def verify_commands(mn,aa,cfg=tuple([0 if i & 4 else 128 for i in range(16)])):
         kwargs = {'DDDDDDDD':tuple(5000 for i in range(16) if (pppp & (1 << i)))}
         verify_command(mn,aa,mn.read_32_bit_pulse_period_group(aa,pppp),**kwargs)
 
-
 if __name__ == "__main__":                 
     # createthe OmuxNET object
     mn = OmstNET.OmstNET()
     # list the available ttys
     ttys = mn.tty.list_ttys()
     # print a menu
+    print('List of available ttys')
     for tty in ttys:
         print(tty,ttys[tty])
     # ask user to select a port
@@ -249,14 +251,30 @@ if __name__ == "__main__":
     print('\n')
     if ttychoice in ttys:
         baudrates = mn.tty.list_baudrates()
+        print('Check baudrate jumpers')
         for baudrate in baudrates:
             print(baudrate,baudrates[baudrate])
-        baudratechoice = int(input('choose a baudrate (check brain jumpers): '),10)
+        baudratechoice = int(input('Select baudrate: '),10)
         if baudratechoice in mn.tty.baudrates:
             baudrate = int(mn.tty.baudrates[baudratechoice])
         print('\n')
         # open the port
         if mn.tty.open(ttys[ttychoice],int(mn.tty.baudrates[baudratechoice])):
+            
+            print('Check binary mode jumper')
+            print(0,'ASCII mode')
+            print(1,'BINARY mode')
+            chmode = int(input('Select character mode: '),10)
+            mn.binary_mode = (chmode == 1)
+            print('\n')
+            
+            print('Check verification mode jumper')
+            print(0,'Use CHECKSUM')
+            print(1,'use CRC16')
+            dvfmode = int(input('Select verification mode: '),10)
+            mn.crc_mode = (dvfmode == 1)
+            print('\n')
+            
             # build a list of devices by seeing which
             # addresses ACK a 'Power Up Clear' command
             devices = mn.list_mistic_devices()
@@ -272,4 +290,4 @@ if __name__ == "__main__":
     else:
         print('{:d} : invalid port selection'.format(choice))
 
-
+        

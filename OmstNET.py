@@ -33,6 +33,7 @@ import datetime                         # for timedelta
 from   collections import namedtuple    # used to return mistic data
 from   collections import OrderedDict   # used to build mistic commands and parse responses
 import inspect                          # used to parse mistic responses
+##import binascii as ba                   # hexlify
 
 # init the utils such as logging
 utl._init()
@@ -40,9 +41,13 @@ utl._init()
 MsgFmt = namedtuple('MsgFmt',['cmd','rsp'])
 CmdFmt = namedtuple('CmdFmt',['cmd','args'])
 RspMsg = namedtuple('RspMsg',['ack','data'])
+PktTyp = namedtuple('PktTyp',['jumpers','options'])
 
 class OmstNET:    
 
+    binary_mode = False
+    crc_mode = False
+    
     """
     'MISTIC PROTOCOL USER’S GUIDE, Form 270-100823 — August, 2010'
     p2-5
@@ -310,33 +315,32 @@ class OmstNET:
         'SET PID LOOP MIN-MAX OUTPUT LIMITS':MsgFmt('p LL HHHHHHHH LLLLLLLL',None),
         'SET PID LOOP MIN-MAX SETPOINT LIMITS':MsgFmt('o LL HHHHHHHH LLLLLLLL',None)
         }       
-                
+
+##        Bit 0 = Frequency resolution setting: 0 = 1 Hz, 1 = 10 Hz.
+##        Bit 1 = Not used.
+##        Bit 2 = Not used.
+##        Bit 3 = Not used.
+##        Bit 4 = CRC initialization value: 0 = 0000, 1 = FFFF.
+##        Bit 5 = CRC method select: 0 = reverse, 1 = classical.
+##        Bit 6 = CRC polynomial select: 0 = CRC16, 1 = CCITT.
+##        Bit 7 = Global event interrupt enable: 0 = disabled, 1 = enabled.
     def __init__(self):
         """
         """
         self.tty = tty.OmstTTY()
         # array of bytes, resolution is 10ms
         self.response_delay = {}
-        # True if using binary
-        self.is_binary = {}
-        # True if using crc
-        self.is_crc = {}
+        
         # save a copy of the 'SET SYSTEM OPTIONS" byte
-        self.system_options = {}
-        # if crc table has not been initialized
-        if OmstNET.crc_table == None:
-            # init the array of crc tables indexed by
-            # two options bits
-            OmstNET.crc_table = (
-                self.crc16r,
-                self.crc16,
-                self.ccittr,
-                self.ccitt
-                )
+        self.brain_syst_options = {}
+        
         # not sure if this is needed but it might be since
         # there is a repeat last response and we don't want
         # to lose sight of what command was sent
         self.last_command = {}
+
+        if self.crc16r == None:
+            self.crc16r = self.generate_crc_table(0xa001)            
 
     @utl.logger
     def get_response_timeout(self,aa):
@@ -365,6 +369,9 @@ class OmstNET:
                 + 0.010 * self.response_delay[aa] \
                 + perf_counter() \
                 + 0.010
+            # some extra time for twiddling termios in binary mode
+            if self.binary_mode:
+                to += 0.005 * max_opto_msg//2
             return to
         return -1
 
@@ -372,14 +379,24 @@ class OmstNET:
     def verify_dvf(self,aa,data):
         """
         """
-        if self.using_crc(aa):
-            act = int(data[-5:-1],16)
-            exp = self.crc(data[:-5])
-            return(act == exp)
-        else:            
-            act = int(data[-3:-1],16)
-            exp = self.chksum(data[:-3])
-            return(act == exp)
+        if self.binary_mode:
+            if self.crc_mode:
+                exp = int.from_bytes(data[-2:],byteorder='big')
+                act = self.crc(aa,data[0:-2])
+                return(act == exp)
+            else:
+                exp = int.from_bytes(data[-1:],byteorder='big')
+                act = self.chksum(aa,data[0:-1])
+                return(act == exp)
+        else:
+            if self.crc_mode:
+                act = int(data[-5:-1],16)
+                exp = self.crc(aa,data[:-5])
+                return(act == exp)
+            else:            
+                act = int(data[-3:-1],16)
+                exp = self.chksum(aa,data[:-3])
+                return(act == exp)
         return False
 
     @utl.logger
@@ -617,7 +634,48 @@ class OmstNET:
         'CRC polynomial select':(6,0),          # 0 = CRC16, 1 = CCITT.
         'Global event interrupt enable':(7,0)   # 0 = disabled, 1 = enabled.
         }
+
+    @utl.logger
+    def set_frequency_resolution_to_10_hz(self,aa,SS=1,CC=0):
+        rsp = self.send_receive_2(aa,'SET SYSTEM OPTIONS',inspect.currentframe())
+        if rsp.ack == 'A':
+            self.brain_syst_options[aa] = rsp.data[0]
+        return rsp
     
+    @utl.logger
+    def set_frequency_resolution_to_1_hz(self,aa,SS=0,CC=1):
+        if rsp.ack == 'A':
+            self.brain_syst_options[aa] = rsp.data[0]
+        return rsp
+
+    @utl.logger
+    def get_frequency_resolution(self,aa,SS=0,CC=0):
+        rsp = self.send_receive_2(aa,'SET SYSTEM OPTIONS',inspect.currentframe())
+        if rsp.ack == 'A':
+            self.brain_syst_options[aa] = rsp.data[0]
+        return rsp
+    
+    @utl.logger
+    def enable_global_interrupt(self,aa,SS=128,CC=0):
+        rsp = self.send_receive_2(aa,'SET SYSTEM OPTIONS',inspect.currentframe())
+        if rsp.ack == 'A':
+            self.brain_syst_options[aa] = rsp.data[0]
+        return rsp
+    
+    @utl.logger
+    def disable_global_interrupt(self,aa,SS=0,CC=128):
+        rsp = self.send_receive_2(aa,'SET SYSTEM OPTIONS',inspect.currentframe())
+        if rsp.ack == 'A':
+            self.brain_syst_options[aa] = rsp.data[0]
+        return rsp
+
+    @utl.logger
+    def get_global_interrupt_enable(self,aa,SS=0,CC=0):
+        rsp = self.send_receive_2(aa,'SET SYSTEM OPTIONS',inspect.currentframe())
+        if rsp.ack == 'A':
+            self.brain_syst_options[aa] = rsp.data[0]
+        return rsp
+
     @utl.logger
     def set_system_options(self,aa,SS=0,CC=0):
         """
@@ -4087,78 +4145,60 @@ class OmstNET:
                         # so reverse the order for transmit
                         for e in reversed(kwargs[key]):
                             txpkt += '{:0{:d}X}'.format(e,len(key))            
-        if not self.using_crc(aa):
-            txpkt += '{:02X}\r'.format(self.chksum(txpkt[1:]))
-            self.chksum(str(100))
+        if self.crc_mode:
+            txpkt += '{:04X}\r'.format(self.crc(aa,txpkt[1:]))
         else:
-            txpkt += '{:04X}\r'.format(self.crc(txpkt[1:]))
+            txpkt += '{:02X}\r'.format(self.chksum(aa,txpkt[1:]))
         return txpkt
 
     @utl.logger
-    def build_binary_command(self,aa,cmd,frame):
+    def build_binary_command(self,aa,cmd,frame):        
         """
-        aa - device address in range(256)
-        cmd - key to command and response format into self.commands
-        frame - the callers frame so we can verify args
-
-        EXAMPLES :
-            mn.set_io_configuration_group(0x8f,15,(4,4,6,0x84))
-
-            Command
-            Response
-            8F 09 47 000F 84 06 04 04 AB48
-            03 00 F0 00
-            Sends a Set I/O Configuration - Group command in Binary protocol to the I/O unit at address 8F Hex.
-            Channels 03, 02, 01 and 00 are selected (MMMM = 000F) to be configured as follows:
-            Channel 03 = 84 Hex (DA4 0 to 5 VDC analog output)
-            Channel 02 = 06 Hex (AD6 0 to 5 VDC analog input)
-            Channel 01 = 04 Hex (AD4 ICTD analog input)
-            Channel 00 = 04 Hex (AD4 ICTD analog input)
-            Data verification method is 16-bit CRC.
         """
-        # get args passed to the function
-        fun_args = tuple(inspect.getargvalues(frame).args)
-        # get args required by the command
-        cmd_args = tuple(self.commands[cmd].cmd.split(' ')[1:])
-        # if args are required, make sure we have them all
-        if cmd_args and fun_args[-len(cmd_args):] == cmd_args:
-            # build kwargs
-            values = inspect.getargvalues(frame)[3]
-            # beware, can't pass kwargs as parameter to a function
-            # without losing the OrderedDict nature
-            kwargs = OrderedDict()
-            for arg in cmd_args:
-                kwargs[arg] = values[arg]
-            # command character
-            txpkt = bytearray([aa,0,ord(self.commands[cmd].cmd.split(' ')[0])])
-            # process the args
-            for key in kwargs:
-                if isinstance(kwargs[key],int):
-                    txpkt += bytes.fromhex('{:0{:d}X}'.format(kwargs[key],len(key)))
-                elif isinstance(kwargs[key],tuple):
-                    # we're assuming data is passed starting with lower index
-                    # so reverse the order for transmit
-                    for e in reversed(kwargs[key]):
-                        txpkt += bytes.fromhex('{:0{:d}X}'.format(e,len(key)))
-            if not self.using_crc(aa):
-                txpkt[1] = len(txpkt[2:]) + 1
-                txpkt += bytes([self.chksum(txpkt)])
-            else:
-                txpkt[1] = len(txpkt[2:]) + 2
-                crc = self.crc(txpkt)
-                txpkt += bytes([(crc >> 8)&255,crc & 255])
-            return txpkt
-        return ''
+        cmdfmt = CmdFmt(self.commands[cmd].cmd.split(' ')[0],\
+                         tuple(self.commands[cmd].cmd.split(' ')[1:]))
+        # start with header
+        txpkt = bytearray()
+        txpkt += (aa).to_bytes(1,byteorder='big')
+        txpkt += (0).to_bytes(1,byteorder='big')
+        txpkt += cmdfmt.cmd.encode()
+        if len(cmdfmt.args) > 0:
+            # get args passed to the function
+            fun_args = tuple(inspect.getargvalues(frame).args)
+            # if args are required, make sure we have them all
+            if fun_args[-len(cmdfmt.args):] == cmdfmt.args:
+                # build kwargs
+                values = inspect.getargvalues(frame)[3]
+                # beware, can't pass kwargs as parameter to a function
+                # without losing the OrderedDict nature
+                kwargs = OrderedDict()
+                for arg in cmdfmt.args:
+                    kwargs[arg] = values[arg]
+                for key in kwargs:
+                    if isinstance(kwargs[key],int):
+                        txpkt += (kwargs[key]).to_bytes(len(key)//2,byteorder='big')
+                    elif isinstance(kwargs[key],tuple):
+                        # we're assuming data is passed starting with lower index
+                        # so reverse the order for transmit
+                        for e in reversed(kwargs[key]):
+                            txpkt += e.to_bytes(len(key)//2,byteorder='big')
+        if self.crc_mode:
+            txpkt[1] = len(txpkt[2:]) + 2
+            txpkt += (self.crc(aa,txpkt)).to_bytes(2,byteorder='big')
+        else:
+            txpkt[1] = len(txpkt[2:]) + 1
+            txpkt += (self.chksum(aa,txpkt)).to_bytes(1,byteorder='big')
+        return txpkt
             
     @utl.logger
     def build_command(self,aa,cmd,frame):
         """
         """
         # create Mistic packet to be sent
-        if not self.using_binary(aa):
-            txpkt = self.build_ascii_command(aa,cmd,frame)
-        else:
+        if self.binary_mode:
             txpkt = self.build_binary_command(aa,cmd,frame)            
+        else:
+            txpkt = self.build_ascii_command(aa,cmd,frame)
         return txpkt
 
     @utl.logger
@@ -4178,28 +4218,65 @@ class OmstNET:
                 # read all of them
                 s = self.tty.read(n)
                 rxPkt += s
-                if self.using_binary(aa):
-                    pass
-                else:
-                    an = re.search(r'[AN]',rxPkt)
-                    if an:
-                        rxPkt = rxPkt[an.start():]
-                        cr = re.search(r'\r',rxPkt)
-                        if cr:
-                            rxPkt = rxPkt[:cr.end()]
-                            if self.verify_dvf(aa,rxPkt):
-                                if self.using_crc(aa):
-                                    rsp = (rxPkt[0:1],rxPkt[1:-5])
-                                else:
-                                    rsp = (rxPkt[0:1],rxPkt[1:-3])                                
-                                utl.log_info_message('Response {} time took {:f} secs'.format(rsp,perf_counter()-tb))
-                                return RspMsg(*rsp)
+                an = re.search(r'[AN]',rxPkt)
+                if an:
+                    rxPkt = rxPkt[an.start():]
+                    cr = re.search(r'\r',rxPkt)
+                    if cr:
+                        rxPkt = rxPkt[:cr.end()]
+                        if self.verify_dvf(aa,rxPkt):
+                            if self.crc_mode:
+                                rsp = (rxPkt[0:1],rxPkt[1:-5])
                             else:
-                                return RspMsg('E',2)
+                                rsp = (rxPkt[0:1],rxPkt[1:-3])                                
+                            utl.log_info_message('Response {} time took {:f} secs'.format(rsp,perf_counter()-tb))
+                            return RspMsg(*rsp)
+                        else:
+                            return RspMsg('E',2)
+                else:
+                    # if there are no 'A's or 'N's, packet can't possibly be
+                    # the start of something important, could be leftovers
+                    rxPkt = ''
+        else:
+            # Had an issue where max read was 64 bytes with USB device.
+            # Perhaps a sleep(0) will give kernel time to send more USB
+            # IRPs.
+            sleep(0)
+        return RspMsg('E',29)
+
+    @utl.logger
+    def get_binary_response(self,aa):
+        """
+        """
+        # while response timer running
+        tb = perf_counter()
+        timeout = self.get_response_timeout(aa)
+        utl.log_info_message('Response timeout is {:f} secs'.format(timeout-perf_counter()))
+        rx = bytearray()
+        while perf_counter() < timeout:
+            # if there are bytes waiting to be read
+            n = self.tty.rx_bytes_available()
+            if n > 0:
+                # append data to buffer
+                rx += self.tty.read(n,self.binary_mode)
+                if self.crc_mode and len(rx) >= 4:
+                    if self.verify_dvf(aa,rx):
+                        if rx[1] == 0:
+                            rsp = ('A',rx[2:-2])
+                        else:
+                            rsp = ('N',rx[1])
+                        utl.log_info_message('Response {} time took {:f} secs'.format(rsp,perf_counter()-tb))
+                        return RspMsg(*rsp)
+                elif len(rx) >= 3: 
+                    if self.verify_dvf(aa,rx):
+                        if rx[1] == 0:
+                            rsp = ('A',rx[2:-1])
+                        else:
+                            rsp = ('N',rx[1])
+                        utl.log_info_message('Response {} time took {:f} secs'.format(rsp,perf_counter()-tb))
+                        return RspMsg(*rsp)
                     else:
-                        # if there are no 'A's or 'N's, packet can't possibly be
-                        # the start of something important, could be leftovers
-                        rxPkt = ''
+                        rx = bytearray()
             else:
                 # Had an issue where max read was 64 bytes with USB device.
                 # Perhaps a sleep(0) will give kernel time to send more USB
@@ -4211,11 +4288,12 @@ class OmstNET:
     def get_response(self,aa):
         """
         """
-        if self.using_binary(aa):
-            return ''
+        if self.binary_mode:
+            return self.get_binary_response(aa)
         else:
             return self.get_ascii_response(aa)
     
+    @utl.logger
     def parse_ascii_response(self,aa,cmd,ntrsp):
         """
         split up the data into fields based on self.commands[].rspfmt
@@ -4266,13 +4344,65 @@ class OmstNET:
                 lflds = [ntrsp.data]
             return RspMsg(ntrsp.ack,ntflds(*lflds))
         return RspMsg(ntrsp.ack,None)
+
+    @utl.logger
+    def parse_binary_response(self,aa,cmd,ntrsp):
+        """
+        split up the data into fields based on self.commands[].rspfmt
+        """
+        if ntrsp.ack == 'A':
+            rspfmt = self.commands[cmd].rsp
+            if rspfmt:
+                fields = rspfmt.split(' ')
+                fields = [field for field in fields]
+                ntflds = namedtuple('ntflds',fields)
+                widths = tuple(len(field) for field in ntflds._fields)
+                # data length expected
+                explen = sum(widths)
+                data = bytearray(ntrsp.data)
+                lflds = []
+                if len(fields) > 1:
+                    for width in widths:
+                        lflds += [int.from_bytes(data[:width//2],byteorder='big')]
+                        data = data[width//2:]
+                elif len(fields) == 1:
+                    width = widths[0]
+                    for i in range(0,len(data),width//2):
+                        lflds += [int.from_bytes(data[:width//2],byteorder='big')]
+                        data = data[width//2:]
+                    # we're assuming data is returned starting with higher index
+                    # so reverse the order for easer indexing
+                    lflds = [tuple(reversed(lflds))]
+                else:
+                    lflds = []
+                rsp = RspMsg(ntrsp.ack,ntflds(*lflds))
+                return rsp
+            else:
+                t = (ntrsp.ack,(None,))
+                ntrsp = namedtuple('ntrsp',['ack','data'])
+                return ntrsp(*t)
+                
+        # Mistic returns a hex error
+        elif ntrsp.ack == 'N':
+            ntflds = namedtuple('ntflds',['ERROR'])
+            lflds = [ntrsp.data]
+            return RspMsg(ntrsp.ack,ntflds(*lflds))
+        # we return TBD errors
+        elif ntrsp.ack == 'E':
+            ntflds = namedtuple('ntflds',['ERROR'])
+            if isinstance(ntrsp.data,int):
+                lflds = [int(ntrsp.data)]
+            else:
+                lflds = [ntrsp.data]
+            return RspMsg(ntrsp.ack,ntflds(*lflds))
+        return RspMsg(ntrsp.ack,None)
         
     @utl.logger
     def parse_response_data(self,aa,cmd,pkt):
         """
         """
-        if self.using_binary(aa):
-            return ''
+        if self.binary_mode:
+            return self.parse_binary_response(aa,cmd,pkt)
         else:
             return self.parse_ascii_response(aa,cmd,pkt)
     
@@ -4284,43 +4414,47 @@ class OmstNET:
         if cmd != 'REPEAT LAST RESPONSE':
             self.last_command[aa] = cmd
         txpkt = self.build_command(aa,cmd,frame)
-        utl.log_info_message(txpkt)
-        # start with a clean slate
-        self.tty.flush_input_buffer()
-        # send the bytes
-        self.tty.write(txpkt)
-        rsp = self.get_response(aa)
-        utl.log_info_message(rsp)
+        for i in range(3):
+            utl.log_info_message(txpkt)
+            # start with a clean slate
+            self.tty.flush_input_buffer(self.binary_mode)
+            # send the bytes
+            self.tty.write(txpkt,self.binary_mode)
+            rsp = self.get_response(aa)
+            utl.log_info_message(rsp)
+            if rsp.ack == 'A':
+                break
         # send last command response format for parsing
         if cmd == 'REPEAT LAST RESPONSE':
             return self.parse_response_data(aa,self.last_command[aa],rsp)
         return self.parse_response_data(aa,cmd,rsp)
 
     @utl.logger
-    def crc(self,data,table=0,crc=0):
+    def crc(self,aa,data):
         """
         compute the crc.
         """
+        crc = 0
         # if this is a string
         if isinstance(data,str):
             utl.log_info_message('Init crc to {:04X}'.format(crc))
-            utl.log_info_message('computing {}'.format(self.crc_type[table]))
+            utl.log_info_message('computing crc16r')
             for ch in data:
                 i = crc ^ ord(ch)
-                crc = (crc >> 8) ^ self.crc_table[table][i & 255]
-            return crc
+                crc = (crc >> 8) ^ self.crc16r[i & 255]
+            return crc & 0xffff
         # elif this is an array of bytes
         elif isinstance(data,bytes) or isinstance(data,bytearray):
             utl.log_info_message('Init crc to {:04X}'.format(crc))
-            utl.log_info_message('computing {}'.format(self.crc_type[table]))                
+            utl.log_info_message('computing crc16r')             
             for b in data:
                 i = crc ^ b
-                crc = (crc >> 8) ^ self.crc_table[table][i & 255]
-            return crc                
+                crc = (crc >> 8) ^ self.crc16r[i & 255]
+            return crc & 0xffff
         return 0
-
+        
     @utl.logger
-    def chksum(self,data):
+    def chksum(self,aa,data):
         """
         compute the 8 bit checksum. Since the same checksum calc is used in both
         ASCII and BINARY mode, data can be a string, bytes, or a bytearray.
@@ -4337,186 +4471,37 @@ class OmstNET:
             return cks % 256
         return 0        
 
-    """
-    mistic can use 1 of 4 crc tables, (crc16r, crc16, ccittr, ccitt),
-    indexed by two bits in the system options.  Default is crc16r.
-    
-    Bit 5 = CRC method select: 0 = reverse, 1 = classical.
-    Bit 6 = CRC polynomial select: 0 = CRC16, 1 = CCITT.
-    """
-    crc_table = None
-
-    crc_type = {
-        0:'crc16 reversed',
-        1:'crc16 normal',
-        2:'ccitt reversed',
-        3:'ccitt normal'
-        }
-
-    def using_crc(self,aa):
+    def crcchrev(self,poly,data):
         """
-        B3000 jumper setting, what type of DVF does this device use?
+        compute a reverse crc
         """
-        return aa in self.is_crc and self.is_crc[aa]
-
-    def using_binary(self,aa):
+        a = 0
+        data <<= 1
+        for i in range(8):
+            data >>= 1
+            if ((data ^ a) & 0x0001):
+                a = ((a >> 1) ^ poly)
+            else:
+                a >>= 1
+        return a
+        
+    def generate_crc_table(self,poly):
         """
-        B3000 jumper setting, what type data does this device exchange?
+        generate a crc table
         """
-        return aa in self.is_binary and self.is_binary[aa]        
+        tbl = []
+        for i in range(256):
+            if poly == 0x1021 or poly == 0x8005:
+                tbl += [self.crcch(poly,i)]
+            else:
+                tbl += [self.crcchrev(poly,i)]
+        return tuple(tbl)
 
     """
-    reverse crc16 table from Mistic guide p2-10
+    crc tables constructed in init
     """
-    crc16r = (
-        0x0000, 0xC0C1,	0xC181,	0x0140,	0xC301,	0x03C0,	0x0280,	0xC241,
-        0xC601,	0x06C0,	0x0780,	0xC741,	0x0500,	0xC5C1,	0xC481,	0x0440,
-        0xCC01,	0x0CC0,	0x0D80,	0xCD41,	0x0F00,	0xCFC1,	0xCE81,	0x0E40,
-        0x0A00,	0xCAC1,	0xCB81,	0x0B40,	0xC901,	0x09C0,	0x0880,	0xC841,
-        0xD801,	0x18C0,	0x1980,	0xD941,	0x1B00,	0xDBC1,	0xDA81,	0x1A40,
-        0x1E00,	0xDEC1,	0xDF81,	0x1F40,	0xDD01,	0x1DC0,	0x1C80,	0xDC41,
-        0x1400,	0xD4C1,	0xD581,	0x1540,	0xD701,	0x17C0,	0x1680,	0xD641,
-        0xD201,	0x12C0,	0x1380,	0xD341,	0x1100,	0xD1C1,	0xD081,	0x1040,
-        0xF001,	0x30C0,	0x3180,	0xF141,	0x3300,	0xF3C1,	0xF281,	0x3240,
-        0x3600,	0xF6C1,	0xF781,	0x3740,	0xF501,	0x35C0,	0x3480,	0xF441,
-        0x3C00,	0xFCC1,	0xFD81,	0x3D40,	0xFF01,	0x3FC0,	0x3E80,	0xFE41,
-        0xFA01,	0x3AC0,	0x3B80,	0xFB41,	0x3900,	0xF9C1,	0xF881,	0x3840,
-        0x2800,	0xE8C1,	0xE981,	0x2940,	0xEB01,	0x2BC0,	0x2A80,	0xEA41,
-        0xEE01,	0x2EC0,	0x2F80,	0xEF41,	0x2D00,	0xEDC1,	0xEC81,	0x2C40,
-        0xE401,	0x24C0,	0x2580,	0xE541,	0x2700,	0xE7C1,	0xE681,	0x2640,
-        0x2200,	0xE2C1,	0xE381,	0x2340,	0xE101,	0x21C0,	0x2080,	0xE041,
-        0xA001,	0x60C0,	0x6180,	0xA141,	0x6300,	0xA3C1,	0xA281,	0x6240,
-        0x6600,	0xA6C1,	0xA781,	0x6740,	0xA501,	0x65C0,	0x6480,	0xA441,
-        0x6C00,	0xACC1,	0xAD81,	0x6D40,	0xAF01,	0x6FC0,	0x6E80,	0xAE41,
-        0xAA01,	0x6AC0,	0x6B80,	0xAB41,	0x6900,	0xA9C1,	0xA881,	0x6840,
-        0x7800,	0xB8C1,	0xB981,	0x7940,	0xBB01,	0x7BC0,	0x7A80,	0xBA41,
-        0xBE01,	0x7EC0,	0x7F80,	0xBF41,	0x7D00,	0xBDC1,	0xBC81,	0x7C40,
-        0xB401,	0x74C0,	0x7580,	0xB541,	0x7700,	0xB7C1,	0xB681,	0x7640,
-        0x7200,	0xB2C1,	0xB381,	0x7340,	0xB101,	0x71C0,	0x7080,	0xB041,
-        0x5000,	0x90C1,	0x9181,	0x5140,	0x9301,	0x53C0,	0x5280,	0x9241,
-        0x9601,	0x56C0,	0x5780,	0x9741,	0x5500,	0x95C1,	0x9481,	0x5440,
-        0x9C01,	0x5CC0,	0x5D80,	0x9D41,	0x5F00,	0x9FC1,	0x9E81,	0x5E40,
-        0x5A00,	0x9AC1,	0x9B81,	0x5B40,	0x9901,	0x59C0,	0x5880,	0x9841,
-        0x8801,	0x48C0,	0x4980,	0x8941,	0x4B00,	0x8BC1,	0x8A81,	0x4A40,
-        0x4E00,	0x8EC1,	0x8F81,	0x4F40,	0x8D01,	0x4DC0,	0x4C80,	0x8C41,
-        0x4400,	0x84C1,	0x8581,	0x4540,	0x8701,	0x47C0,	0x4680,	0x8641,
-        0x8201,	0x42C0,	0x4380,	0x8341,	0x4100,	0x81C1,	0x8081,	0x4040
-    )
-    
-    """
-    crc16 table from Mistic guide p2-9
-    """
-    crc16 = (
-        0x0000,	0x8005,	0x800F,	0x000A,	0x801B,	0x001E,	0x0014,	0x8011,
-        0x8033,	0x0036,	0x003C,	0x8039,	0x0028,	0x802D,	0x8027,	0x0022,
-        0x8063,	0x0066,	0x006C,	0x8069,	0x0078,	0x807D,	0x8077,	0x0072,
-        0x0050,	0x8055,	0x805F,	0x005A,	0x804B,	0x004E,	0x0044,	0x8041,
-        0x80C3,	0x00C6,	0x00CC,	0x80C9,	0x00D8,	0x80DD,	0x80D7,	0x00D2,
-        0x00F0,	0x80F5,	0x80FF,	0x00FA,	0x80EB,	0x00EE,	0x00E4,	0x80E1,
-        0x00A0,	0x80A5,	0x80AF,	0x00AA,	0x80BB,	0x00BE,	0x00B4,	0x80B1,
-        0x8093,	0x0096,	0x009C,	0x8099,	0x0088,	0x808D,	0x8087,	0x0082,
-        0x8183,	0x0186,	0x018C,	0x8189,	0x0198,	0x819D,	0x8197,	0x0192,
-        0x01B0,	0x81B5,	0x81BF,	0x01BA,	0x81AB,	0x01AE,	0x01A4,	0x81A1,
-        0x01E0,	0x81E5,	0x81EF,	0x01EA,	0x81FB,	0x01FE,	0x01F4,	0x81F1,
-        0x81D3,	0x01D6,	0x01DC,	0x81D9,	0x01C8,	0x81CD,	0x81C7,	0x01C2,
-        0x0140,	0x8145,	0x814F,	0x014A,	0x815B,	0x015E,	0x0154,	0x8151,
-        0x8173,	0x0176,	0x017C,	0x8179,	0x0168,	0x816D,	0x8167,	0x0162,
-        0x8123,	0x0126,	0x012C,	0x8129,	0x0138,	0x813D,	0x8137,	0x0132,
-        0x0110,	0x8115,	0x811F,	0x011A,	0x810B,	0x010E,	0x0104,	0x8101,
-        0x8303,	0x0306,	0x030C,	0x8309,	0x0318,	0x831D,	0x8317,	0x0312,
-        0x0330,	0x8335,	0x833F,	0x033A,	0x832B,	0x032E,	0x0324,	0x8321,
-        0x0360,	0x8365,	0x836F,	0x036A,	0x837B,	0x037E,	0x0374,	0x8371,
-        0x8353,	0x0356,	0x035C,	0x8359,	0x0348,	0x834D,	0x8347,	0x0342,
-        0x03C0,	0x83C5,	0x83CF,	0x03CA,	0x83DB,	0x03DE,	0x03D4,	0x83D1,
-        0x83F3,	0x03F6,	0x03FC,	0x83F9,	0x03E8,	0x83ED,	0x83E7,	0x03E2,
-        0x83A3,	0x03A6,	0x03AC,	0x83A9,	0x03B8,	0x83BD,	0x83B7,	0x03B2,
-        0x0390,	0x8395,	0x839F,	0x039A,	0x838B,	0x038E,	0x0384,	0x8381,
-        0x0280,	0x8285,	0x828F,	0x028A,	0x829B,	0x029E,	0x0294,	0x8291,
-        0x82B3,	0x02B6,	0x02BC,	0x82B9,	0x02A8,	0x82AD,	0x82A7,	0x02A2,
-        0x82E3,	0x02E6,	0x02EC,	0x82E9,	0x02F8,	0x82FD,	0x82F7,	0x02F2,
-        0x02D0,	0x82D5,	0x82DF,	0x02DA,	0x82CB,	0x02CE,	0x02C4,	0x82C1,
-        0x8243,	0x0246,	0x024C,	0x8249,	0x0258,	0x825D,	0x8257,	0x0252,
-        0x0270,	0x8275,	0x827F,	0x027A,	0x826B,	0x026E,	0x0264,	0x8261,
-        0x0220,	0x8225,	0x822F,	0x022A,	0x823B,	0x023E,	0x0234,	0x8231,
-        0x8213,	0x0216,	0x021C,	0x8219,	0x0208,	0x820D,	0x8207,	0x0202
-    )
-    
-    """
-    reverse ccitt table from Mistic guide p2-12
-    """
-    ccittr = (
-        0x0000, 0x1189,	0x2312,	0x329B,	0x4624,	0x57AD,	0x6536,	0x74BF,
-        0x8C48,	0x9DC1,	0xAF5A,	0xBED3,	0xCA6C,	0xDBE5,	0xE97E,	0xF8F7,
-        0x1081,	0x0108,	0x3393,	0x221A,	0x56A5,	0x472C,	0x75B7,	0x643E,
-        0x9CC9,	0x8D40,	0xBFDB,	0xAE52,	0xDAED,	0xCB64,	0xF9FF,	0xE876,
-        0x2102,	0x308B,	0x0210,	0x1399,	0x6726,	0x76AF,	0x4434,	0x55BD,
-        0xAD4A,	0xBCC3,	0x8E58,	0x9FD1,	0xEB6E,	0xFAE7,	0xC87C,	0xD9F5,
-        0x3183,	0x200A,	0x1291,	0x0318,	0x77A7,	0x662E,	0x54B5,	0x453C,
-        0xBDCB,	0xAC42,	0x9ED9,	0x8F50,	0xFBEF,	0xEA66,	0xD8FD,	0xC974,
-        0x4204,	0x538D,	0x6116,	0x709F,	0x0420,	0x15A9,	0x2732,	0x36BB,
-        0xCE4C,	0xDFC5,	0xED5E,	0xFCD7,	0x8868,	0x99E1,	0xAB7A,	0xBAF3,
-        0x5285,	0x430C,	0x7197,	0x601E,	0x14A1,	0x0528,	0x37B3,	0x263A,
-        0xDECD,	0xCF44,	0xFDDF,	0xEC56,	0x98E9,	0x8960,	0xBBFB,	0xAA72,
-        0x6306,	0x728F,	0x4014,	0x519D,	0x2522,	0x34AB,	0x0630,	0x17B9,
-        0xEF4E,	0xFEC7,	0xCC5C,	0xDDD5,	0xA96A,	0xB8E3,	0x8A78,	0x9BF1,
-        0x7387,	0x620E,	0x5095,	0x411C,	0x35A3,	0x242A,	0x16B1,	0x0738,
-        0xFFCF,	0xEE46,	0xDCDD,	0xCD54,	0xB9EB,	0xA862,	0x9AF9,	0x8B70,
-        0x8408,	0x9581,	0xA71A,	0xB693,	0xC22C,	0xD3A5,	0xE13E,	0xF0B7,
-        0x0840,	0x19C9,	0x2B52,	0x3ADB,	0x4E64,	0x5FED,	0x6D76,	0x7CFF,
-        0x9489,	0x8500,	0xB79B,	0xA612,	0xD2AD,	0xC324,	0xF1BF,	0xE036,
-        0x18C1,	0x0948,	0x3BD3,	0x2A5A,	0x5EE5,	0x4F6C,	0x7DF7,	0x6C7E,
-        0xA50A,	0xB483,	0x8618,	0x9791,	0xE32E,	0xF2A7,	0xC03C,	0xD1B5,
-        0x2942,	0x38CB,	0x0A50,	0x1BD9,	0x6F66,	0x7EEF,	0x4C74,	0x5DFD,
-        0xB58B,	0xA402,	0x9699,	0x8710,	0xF3AF,	0xE226,	0xD0BD,	0xC134,
-        0x39C3,	0x284A,	0x1AD1,	0x0B58,	0x7FE7,	0x6E6E,	0x5CF5,	0x4D7C,
-        0xC60C,	0xD785,	0xE51E,	0xF497,	0x8028,	0x91A1,	0xA33A,	0xB2B3,
-        0x4A44,	0x5BCD,	0x6956,	0x78DF,	0x0C60,	0x1DE9,	0x2F72,	0x3EFB,
-        0xD68D,	0xC704,	0xF59F,	0xE416,	0x90A9,	0x8120,	0xB3BB,	0xA232,
-        0x5AC5,	0x4B4C,	0x79D7,	0x685E,	0x1CE1,	0x0D68,	0x3FF3,	0x2E7A,
-        0xE70E,	0xF687,	0xC41C,	0xD595,	0xA12A,	0xB0A3,	0x8238,	0x93B1,
-        0x6B46,	0x7ACF,	0x4854,	0x59DD,	0x2D62,	0x3CEB,	0x0E70,	0x1FF9,
-        0xF78F,	0xE606,	0xD49D,	0xC514,	0xB1AB,	0xA022,	0x92B9,	0x8330,
-        0x7BC7,	0x6A4E,	0x58D5,	0x495C,	0x3DE3,	0x2C6A,	0x1EF1,	0x0F78
-    )
-    
-    """
-    ccitt table from Mistic guide p2-11
-    """
-    ccitt = (
-        0x0000,	0x1021,	0x2042,	0x3063,	0x4084,	0x50A5,	0x60C6,	0x70E7,
-        0x8108,	0x9129,	0xA14A,	0xB16B,	0xC18C,	0xD1AD,	0xE1CE,	0xF1EF,
-        0x1231,	0x0210,	0x3273,	0x2252,	0x52B5,	0x4294,	0x72F7,	0x62D6,
-        0x9339,	0x8318,	0xB37B,	0xA35A,	0xD3BD,	0xC39C,	0xF3FF,	0xE3DE,
-        0x2462,	0x3443,	0x0420,	0x1401,	0x64E6,	0x74C7,	0x44A4,	0x5485,
-        0xA56A,	0xB54B,	0x8528,	0x9509,	0xE5EE,	0xF5CF,	0xC5AC,	0xD58D,
-        0x3653,	0x2672,	0x1611,	0x0630,	0x76D7,	0x66F6,	0x5695,	0x46B4,
-        0xB75B,	0xA77A,	0x9719,	0x8738,	0xF7DF,	0xE7FE,	0xD79D,	0xC7BC,
-        0x48C4,	0x58E5,	0x6886,	0x78A7,	0x0840,	0x1861,	0x2802,	0x3823,
-        0xC9CC,	0xD9ED,	0xE98E,	0xF9AF,	0x8948,	0x9969,	0xA90A,	0xB92B,
-        0x5AF5,	0x4AD4,	0x7AB7,	0x6A96,	0x1A71,	0x0A50,	0x3A33,	0x2A12,
-        0xDBFD,	0xCBDC,	0xFBBF,	0xEB9E,	0x9B79,	0x8B58,	0xBB3B,	0xAB1A,
-        0x6CA6,	0x7C87,	0x4CE4,	0x5CC5,	0x2C22,	0x3C03,	0x0C60,	0x1C41,
-        0xEDAE,	0xFD8F,	0xCDEC,	0xDDCD,	0xAD2A,	0xBD0B,	0x8D68,	0x9D49,
-        0x7E97,	0x6EB6,	0x5ED5,	0x4EF4,	0x3E13,	0x2E32,	0x1E51,	0x0E70,
-        0xFF9F,	0xEFBE,	0xDFDD,	0xCFFC,	0xBF1B,	0xAF3A,	0x9F59,	0x8F78,
-        0x9188,	0x81A9,	0xB1CA,	0xA1EB,	0xD10C,	0xC12D,	0xF14E,	0xE16F,
-        0x1080,	0x00A1,	0x30C2,	0x20E3,	0x5004,	0x4025,	0x7046,	0x6067,
-        0x83B9,	0x9398,	0xA3FB,	0xB3DA,	0xC33D,	0xD31C,	0xE37F,	0xF35E,
-        0x02B1,	0x1290,	0x22F3,	0x32D2,	0x4235,	0x5214,	0x6277,	0x7256,
-        0xB5EA,	0xA5CB,	0x95A8,	0x8589,	0xF56E,	0xE54F,	0xD52C,	0xC50D,
-        0x34E2,	0x24C3,	0x14A0,	0x0481,	0x7466,	0x6447,	0x5424,	0x4405,
-        0xA7DB,	0xB7FA,	0x8799,	0x97B8,	0xE75F,	0xF77E,	0xC71D,	0xD73C,
-        0x26D3,	0x36F2,	0x0691,	0x16B0,	0x6657,	0x7676,	0x4615,	0x5634,
-        0xD94C,	0xC96D,	0xF90E,	0xE92F,	0x99C8,	0x89E9,	0xB98A,	0xA9AB,
-        0x5844,	0x4865,	0x7806,	0x6827,	0x18C0,	0x08E1,	0x3882,	0x28A3,
-        0xCB7D,	0xDB5C,	0xEB3F,	0xFB1E,	0x8BF9,	0x9BD8,	0xABBB,	0xBB9A,
-        0x4A75,	0x5A54,	0x6A37,	0x7A16,	0x0AF1,	0x1AD0,	0x2AB3,	0x3A92,
-        0xFD2E,	0xED0F,	0xDD6C,	0xCD4D,	0xBDAA,	0xAD8B,	0x9DE8,	0x8DC9,
-        0x7C26,	0x6C07,	0x5C64,	0x4C45,	0x3CA2,	0x2C83,	0x1CE0,	0x0CC1,
-        0xEF1F,	0xFF3E,	0xCF5D,	0xDF7C,	0xAF9B,	0xBFBA,	0x8FD9,	0x9FF8,
-        0x6E17,	0x7E36,	0x4E55,	0x5E74,	0x2E93,	0x3EB2,	0x0ED1,	0x1EF0
-    )
-    
+    crc16r = None
+        
     def list_mistic_devices(self):
         """
         Build a list of Mistic devices by sending a
@@ -4536,28 +4521,44 @@ class OmstNET:
         print('\nFound {:d} Mistic devices'.format(len(devices)))
         return devices
 
-
 if __name__ == "__main__":             
     # create the OmuxNET object
     mn = OmstNET()
     # list the available ttys
     ttys = mn.tty.list_ttys()
     # print a menu
+    print('List of available ttys')
     for tty in ttys:
         print(tty,ttys[tty])
     # ask user to select a port
-    ttychoice = int(input('choose a tty by number from the above list: '),10)
+    ttychoice = int(input('Select tty: '),10)
     print('\n')
     if ttychoice in ttys:
+        print('Check baudrate jumpers')
         baudrates = mn.tty.list_baudrates()
         for baudrate in baudrates:
             print(baudrate,baudrates[baudrate])
-        baudratechoice = int(input('choose a baudrate (check brain jumpers): '),10)
+        baudratechoice = int(input('Select baudrate: '),10)
         if baudratechoice in mn.tty.baudrates:
             baudrate = int(mn.tty.baudrates[baudratechoice])
         print('\n')
         # open the port
         if mn.tty.open(ttys[ttychoice],int(mn.tty.baudrates[baudratechoice])):
+
+            print('Check binary mode jumper')
+            print(0,'ASCII mode')
+            print(1,'BINARY mode')
+            chmode = int(input('Select character mode: '),10)
+            mn.binary_mode = chmode == 1
+            print('\n')
+            
+            print('Check verification mode jumper')
+            print(0,'Use CHECKSUM')
+            print(1,'use CRC16')
+            dvfmode = int(input('Select verification mode: '),10)
+            mn.crc_mode = dvfmode == 1
+            print('\n')
+            
             mn.devices = mn.list_mistic_devices()
             for device in mn.devices:
                 rsp = mn.what_am_i(device)

@@ -33,6 +33,13 @@ class OmstTTY:
         self.tty = None
         self.fd = None
         self.baud = None
+
+    """
+    A lookup table of parity values
+    """
+    parity_table = tuple(1 & sum([1 for i in range(8) if (j & (1 << i))])\
+                         for j in range(256))
+    
         
     """
     field indices in termios structure
@@ -157,7 +164,8 @@ class OmstTTY:
                             | termios.CLOCAL \
                             | termios.CREAD \
                             | termios.CS8
-                tios[self.offset_termios_flags.index('cc')][self.offset_termios_cc.index('VMIN')] = 1
+##                tios[self.offset_termios_flags.index('cc')][self.offset_termios_cc.index('VMIN')] = 1
+                tios[self.offset_termios_flags.index('cc')][self.offset_termios_cc.index('VMIN')] = 0
                 tios[self.offset_termios_flags.index('cc')][self.offset_termios_cc.index('VTIME')] = 0   
                 self.cfsetspeed(tios,getattr(termios,'B{:d}'.format(baud)))
                 termios.tcsetattr(fd,termios.TCSAFLUSH,tios)
@@ -185,19 +193,50 @@ class OmstTTY:
             self.fd = None
         
     @utl.logger
-    def write(self,pkt):
+    def write(self,pkt,mode=False):
         """
         write data to port
         """
-        # send the bytes
-        os.write(self.fd,pkt.encode())
+        if mode:
+            tios = termios.tcgetattr(self.fd)
+            c_cflag = tios[self.offset_termios_flags.index('cflag')]
+            c_cflag |= termios.PARENB
+            # send the address
+            if self.parity_table[pkt[0]]:
+                c_cflag &= ~termios.PARODD
+            else:
+                c_cflag |= termios.PARODD
+            tios[self.offset_termios_flags.index('cflag')] = c_cflag
+            termios.tcsetattr(self.fd,termios.TCSANOW,tios)
+            n = os.write(self.fd,(pkt[0]).to_bytes(1,byteorder='big'))
+            # send the data
+            for i in range(1,len(pkt)):
+                if self.parity_table[pkt[i]]:
+                    c_cflag |= termios.PARODD                   
+                else:
+                    c_cflag &= ~termios.PARODD
+                tios[self.offset_termios_flags.index('cflag')] = c_cflag
+                termios.tcsetattr(self.fd,termios.TCSADRAIN,tios)
+                n += os.write(self.fd,(pkt[i]).to_bytes(1,byteorder='big'))
+            return n
+        else:
+            tios = termios.tcgetattr(self.fd)
+            c_cflag = tios[self.offset_termios_flags.index('cflag')]
+            if c_cflag | termios.PARENB:
+                c_cflag &= ~termios.PARENB
+                termios.tcsetattr(self.fd,termios.TCSANOW,tios)               
+            # send the bytes
+            return os.write(self.fd,pkt.encode())
 
     @utl.logger
-    def read(self,n):
+    def read(self,n,mode=False):
         """
         read data from port
         """
-        return os.read(self.fd,n).decode()
+        if mode:
+            return os.read(self.fd,n)
+        else:
+            return os.read(self.fd,n).decode()
 
     @utl.logger
     def rx_bytes_available(self):
@@ -212,7 +251,7 @@ class OmstTTY:
         return n
 
     @utl.logger
-    def flush_input_buffer(self):
+    def flush_input_buffer(self,mode=False):
         """
         optomux responses do not maintain any type of message number
         so the only way to make sure to tie a command to a response
@@ -222,7 +261,7 @@ class OmstTTY:
         while True:
             n = self.rx_bytes_available()
             if n != 0:
-                self.read(n)
+                self.read(n,mode)
             else:
                 break
 
